@@ -1,0 +1,2 @@
+[console_scripts]
+redgewise = redgewise.cli:main
