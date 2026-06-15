@@ -66,6 +66,7 @@ def run_build(args: argparse.Namespace) -> int:
     print(f"Residues:   {summary.n_residues}")
     print(f"Atoms:      {summary.n_atoms}")
     print(f"VDW pairs:  {summary.n_vdw_type_pairs}")
+    print(f"Excluded atom pairs:  {len(interaction_information.excluded_atom_pairs)}")
 
     print()
     print(f"rlist:          {mdp_information.rlist}")

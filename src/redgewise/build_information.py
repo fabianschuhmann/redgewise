@@ -3,13 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
-@dataclass
-class InteractionInformation:
-    residues: dict[int, ResidueInformation] = field(default_factory=dict)
-    vdw_by_type_pair: dict[tuple[str, str], VdwInteraction] = field(
-        default_factory=dict
-    )
-    excluded_atom_pairs: set[tuple[int, int]] = field(default_factory=set)
+@dataclass(frozen=True)
+class InteractionInformationSummary:
+    n_residues: int
+    n_atoms: int
+    n_vdw_type_pairs: int
+    residue_names: list[str]
+    bead_types: list[str]
 
 @dataclass(frozen=True)
 class AtomInformation:
@@ -59,6 +59,7 @@ class InteractionInformation:
     vdw_by_type_pair: dict[tuple[str, str], VdwInteraction] = field(
         default_factory=dict
     )
+    excluded_atom_pairs: set[tuple[int, int]] = field(default_factory=set)
 
     def add_atom_to_residue(
         self,
