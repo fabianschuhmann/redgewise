@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import json
@@ -22,7 +21,8 @@ from redgewise.build_information import pair_key
 
 
 class RedgewiseComputeError(Exception):
-    """An error occured during network computation."""
+    """Expected compute-time error with a user-readable message."""
+
 
 COULOMB_CONSTANT = 138.935458
 ATOM_BLOCK_SIZE = 512
@@ -118,6 +118,31 @@ class FrameEdgeAccumulator:
         )
 
 
+def write_vertex_members(
+    output: Path,
+    atom_table: dict[str, np.ndarray],
+    atom_to_vertex: np.ndarray,
+) -> None:
+    table = pa.table(
+        {
+            "vertex_id": pa.array(atom_to_vertex.astype(np.int32), type=pa.int32()),
+            "atom_index": pa.array(
+                atom_table["atom_index"].astype(np.int32),
+                type=pa.int32(),
+            ),
+            "atom_nr": pa.array(
+                atom_table["atom_nr"].astype(np.int32),
+                type=pa.int32(),
+            ),
+        }
+    )
+
+    pq.write_table(
+        table,
+        output / "vertex_members.parquet",
+        compression="zstd",
+    )
+
 def compute_network(
     interaction_information: Any,
     mdp_information: Any,
@@ -151,6 +176,11 @@ def compute_network(
         output / "vertices.parquet",
         compression="zstd",
     )
+    write_vertex_members(
+        output=output,
+        atom_table=grouping.atom_table,
+        atom_to_vertex=grouping.atom_to_vertex,
+    )
 
     n_atoms = len(grouping.atom_table["atom_index"])
     n_vertices = len(grouping.vertices)
@@ -160,20 +190,32 @@ def compute_network(
         interaction_information=interaction_information,
     )
 
+    excluded_neighbors = build_excluded_neighbors(
+        excluded_atom_pairs=getattr(interaction_information, "excluded_atom_pairs", set()),
+        n_atoms=n_atoms,
+    )
+
+    atom_molecule_instance = grouping.atom_table["molecule_instance"]
+
     charges = grouping.atom_table["charge"].astype(np.float64, copy=False)
     atom_to_vertex = grouping.atom_to_vertex
 
-    universe = mda.Universe(str(tpr), str(trajectory))
+    try:
+        universe = mda.Universe(str(tpr), str(trajectory))
+    except Exception as exc:
+        raise RedgewiseComputeError(
+            f"could not load trajectory with MDAnalysis: {trajectory}"
+        ) from exc
 
     if len(universe.atoms) != n_atoms:
-        raise ValueError(
+        raise RedgewiseComputeError(
             "trajectory atom count does not match InteractionInformation atom count: "
             f"trajectory={len(universe.atoms)}, interaction_information={n_atoms}"
         )
 
     frames_per_part = getattr(options, "frames_per_part", 1)
     if frames_per_part < 1:
-        raise ValueError("frames_per_part must be >= 1")
+        raise RedgewiseComputeError("--frames-per-part must be >= 1")
 
     value_parts: list[pa.Table] = []
     frames_in_part = 0
@@ -183,11 +225,11 @@ def compute_network(
 
     cutoff_nm = mdp_information.max_cutoff
 
-    for _, ts in enumerate(universe.trajectory[:: options.stride]):
+    for processed_frame_index, ts in enumerate(universe.trajectory[:: options.stride]):
         frame_values = compute_frame_values_streaming_cells(
             positions_a=universe.atoms.positions,
             box_a=ts.dimensions,
-            frame_index=int(ts.frame),
+            frame_index=frame_index_from_ts(ts, fallback=processed_frame_index),
             cutoff_nm=cutoff_nm,
             rcoulomb_nm=mdp_information.rcoulomb,
             rvdw_nm=mdp_information.rvdw,
@@ -197,6 +239,8 @@ def compute_network(
             charges=charges,
             atom_to_vertex=atom_to_vertex,
             n_vertices=n_vertices,
+            atom_molecule_instance=atom_molecule_instance,
+            excluded_neighbors=excluded_neighbors,
         )
 
         if frame_values.num_rows > 0:
@@ -215,7 +259,7 @@ def compute_network(
             value_parts.clear()
             frames_in_part = 0
 
-    part_index = flush_value_parts(
+    flush_value_parts(
         value_parts=value_parts,
         values_dir=values_dir,
         part_index=part_index,
@@ -235,6 +279,7 @@ def compute_network(
         n_vertices=n_vertices,
         n_edges=n_edges,
         n_value_rows=total_value_rows,
+        n_excluded_atom_pairs=sum(len(neighbors) for neighbors in excluded_neighbors) // 2,
     )
 
     return ComputeSummary(
@@ -258,6 +303,8 @@ def compute_frame_values_streaming_cells(
     charges: np.ndarray,
     atom_to_vertex: np.ndarray,
     n_vertices: int,
+    atom_molecule_instance: np.ndarray,
+    excluded_neighbors: list[set[int]],
 ) -> pa.Table:
     positions_nm = np.asarray(positions_a, dtype=np.float64) * 0.1
     box_lengths_nm = orthorhombic_box_lengths_nm(box_a)
@@ -305,6 +352,8 @@ def compute_frame_values_streaming_cells(
             charges=charges,
             atom_to_vertex=atom_to_vertex,
             n_vertices=n_vertices,
+            atom_molecule_instance=atom_molecule_instance,
+            excluded_neighbors=excluded_neighbors,
             accumulator=accumulator,
         )
 
@@ -452,6 +501,8 @@ def process_cell_pair(
     charges: np.ndarray,
     atom_to_vertex: np.ndarray,
     n_vertices: int,
+    atom_molecule_instance: np.ndarray,
+    excluded_neighbors: list[set[int]],
     accumulator: FrameEdgeAccumulator,
 ) -> None:
     if same_cell:
@@ -468,6 +519,8 @@ def process_cell_pair(
             charges=charges,
             atom_to_vertex=atom_to_vertex,
             n_vertices=n_vertices,
+            atom_molecule_instance=atom_molecule_instance,
+            excluded_neighbors=excluded_neighbors,
             accumulator=accumulator,
         )
         return
@@ -489,6 +542,8 @@ def process_cell_pair(
                 charges=charges,
                 atom_to_vertex=atom_to_vertex,
                 n_vertices=n_vertices,
+                atom_molecule_instance=atom_molecule_instance,
+                excluded_neighbors=excluded_neighbors,
                 accumulator=accumulator,
             )
 
@@ -506,6 +561,8 @@ def process_same_cell_pair(
     charges: np.ndarray,
     atom_to_vertex: np.ndarray,
     n_vertices: int,
+    atom_molecule_instance: np.ndarray,
+    excluded_neighbors: list[set[int]],
     accumulator: FrameEdgeAccumulator,
 ) -> None:
     blocks = list(iter_atom_blocks(atoms))
@@ -529,6 +586,8 @@ def process_same_cell_pair(
                 charges=charges,
                 atom_to_vertex=atom_to_vertex,
                 n_vertices=n_vertices,
+                atom_molecule_instance=atom_molecule_instance,
+                excluded_neighbors=excluded_neighbors,
                 accumulator=accumulator,
             )
 
@@ -548,6 +607,8 @@ def process_atom_block_pair(
     charges: np.ndarray,
     atom_to_vertex: np.ndarray,
     n_vertices: int,
+    atom_molecule_instance: np.ndarray,
+    excluded_neighbors: list[set[int]],
     accumulator: FrameEdgeAccumulator,
 ) -> None:
     if len(atoms_a) == 0 or len(atoms_b) == 0:
@@ -586,6 +647,22 @@ def process_atom_block_pair(
     vertex_b = vertex_b[keep_vertices]
 
     distances_nm = np.sqrt(distances2_nm[row_index, column_index][keep_vertices])
+
+    keep_nonexcluded = nonexcluded_same_molecule_mask(
+        atom_i=atom_i,
+        atom_j=atom_j,
+        atom_molecule_instance=atom_molecule_instance,
+        excluded_neighbors=excluded_neighbors,
+    )
+
+    if not np.any(keep_nonexcluded):
+        return
+
+    atom_i = atom_i[keep_nonexcluded]
+    atom_j = atom_j[keep_nonexcluded]
+    vertex_a = vertex_a[keep_nonexcluded]
+    vertex_b = vertex_b[keep_nonexcluded]
+    distances_nm = distances_nm[keep_nonexcluded]
 
     add_atom_pair_energies_to_accumulator(
         atom_i=atom_i,
@@ -671,6 +748,54 @@ def iter_atom_blocks(atom_indices: np.ndarray) -> Iterable[np.ndarray]:
         stop = min(start + ATOM_BLOCK_SIZE, len(atom_indices))
         yield atom_indices[start:stop]
 
+def build_excluded_neighbors(
+    excluded_atom_pairs: set[tuple[int, int]],
+    n_atoms: int,
+) -> list[set[int]]:
+    neighbors: list[set[int]] = [set() for _ in range(n_atoms)]
+
+    for atom_i, atom_j in excluded_atom_pairs:
+        atom_i = int(atom_i)
+        atom_j = int(atom_j)
+
+        if atom_i < 0 or atom_j < 0:
+            continue
+
+        if atom_i >= n_atoms or atom_j >= n_atoms:
+            continue
+
+        if atom_i == atom_j:
+            continue
+
+        neighbors[atom_i].add(atom_j)
+        neighbors[atom_j].add(atom_i)
+
+    return neighbors
+
+
+def nonexcluded_same_molecule_mask(
+    atom_i: np.ndarray,
+    atom_j: np.ndarray,
+    atom_molecule_instance: np.ndarray,
+    excluded_neighbors: list[set[int]],
+) -> np.ndarray:
+    keep = np.ones(len(atom_i), dtype=bool)
+
+    same_molecule = (
+        atom_molecule_instance[atom_i]
+        == atom_molecule_instance[atom_j]
+    )
+
+    same_indices = np.nonzero(same_molecule)[0]
+
+    for index in same_indices:
+        atom_a = int(atom_i[index])
+        atom_b = int(atom_j[index])
+
+        if atom_b in excluded_neighbors[atom_a]:
+            keep[index] = False
+
+    return keep
 
 def lj_energy_and_derivative(
     r_nm: np.ndarray,
@@ -721,7 +846,7 @@ def build_type_parameter_arrays(
             key = pair_key(type_i, type_j)
 
             if key not in interaction_information.vdw_by_type_pair:
-                raise ValueError(
+                raise RedgewiseComputeError(
                     "missing VDW interaction for bead-type pair: "
                     f"{type_i}, {type_j}"
                 )
@@ -829,7 +954,7 @@ def orthorhombic_box_lengths_nm(box_a: np.ndarray | None) -> np.ndarray | None:
         return None
 
     if len(box) >= 6 and np.any(np.abs(box[3:6] - 90.0) > 1e-4):
-        raise ValueError(
+        raise RedgewiseComputeError(
             "triclinic boxes are not supported by the streaming cell-list backend yet"
         )
 
@@ -873,6 +998,20 @@ def ordered_pair(a: int, b: int) -> tuple[int, int]:
     return b, a
 
 
+def frame_index_from_ts(ts: Any, fallback: int) -> int:
+    frame = getattr(ts, "frame", None)
+
+    if frame is None:
+        return fallback
+
+    frame = int(frame)
+
+    if frame < 0:
+        return fallback
+
+    return frame
+
+
 def progress_iterator(
     iterable: list[tuple[int, int]],
     total: int,
@@ -901,11 +1040,13 @@ def write_metadata(
     n_vertices: int,
     n_edges: int,
     n_value_rows: int,
+    n_excluded_atom_pairs: int,
 ) -> None:
     metadata = {
         "redgewise_version": __version__,
         "schema": "redgewise_sparse_undirected_per_frame_v1",
         "stride": options.stride,
+        "frames_per_part": getattr(options, "frames_per_part", 1),
         "length_unit": "nm",
         "energy_unit": "kJ/mol",
         "derivative_unit": "kJ/mol/nm",
@@ -918,6 +1059,10 @@ def write_metadata(
         "n_vertices": n_vertices,
         "n_edges": n_edges,
         "n_value_rows": n_value_rows,
+        "n_excluded_atom_pairs": n_excluded_atom_pairs,
+        "nonbonded_exclusion_model": (
+            "nrexcl_bonds_constraints_explicit_exclusions_pairs_ignored"
+        ),
         "rlist_nm": mdp_information.rlist,
         "rcoulomb_nm": mdp_information.rcoulomb,
         "rvdw_nm": mdp_information.rvdw,

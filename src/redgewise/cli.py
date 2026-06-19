@@ -6,6 +6,8 @@ from pathlib import Path
 from redgewise import __version__
 from redgewise.build import run_build
 
+from redgewise.plot_vmd import run_plot_vmd
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
@@ -93,6 +95,91 @@ def main(argv: list[str] | None = None) -> int:
 
 
     build.set_defaults(func=run_build)
+
+
+    plot = subparsers.add_parser(
+        "plot",
+        help="Plot or export analyses from a redgewise build output.",
+    )
+
+    plot_subparsers = plot.add_subparsers(dest="plot_command", required=True)
+
+    vmd = plot_subparsers.add_parser(
+        "vmd",
+        help="Write a VMD TCL drawer and pseudo-bead PDB from a redgewise output.",
+    )
+
+    vmd.add_argument(
+        "-i",
+        "--input",
+        type=Path,
+        required=True,
+        help="Redgewise build output directory.",
+    )
+
+    vmd.add_argument(
+        "-s",
+        "--structure",
+        type=Path,
+        required=True,
+        help="Structure file used to compute vertex centers, e.g. .gro, .pdb, or .tpr.",
+    )
+
+    vmd.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        required=True,
+        help="Output directory for drawer.tcl and network_beads.pdb.",
+    )
+
+    vmd.add_argument(
+        "--value",
+        choices=("vdw", "cl", "vdw+cl", "dvdw", "dcl", "dvdw+dcl"),
+        default="vdw+cl",
+        help="Edge value used for cylinder radius. Default: vdw+cl.",
+    )
+
+    vmd.add_argument(
+        "--radius-scale",
+        type=float,
+        default=0.01,
+        help="Cylinder radius scaling factor applied to abs(mean edge value).",
+    )
+
+    vmd.add_argument(
+        "--min-abs-value",
+        type=float,
+        default=0.0,
+        help="Only draw edges with abs(mean selected value) >= this threshold.",
+    )
+
+    vmd.add_argument(
+        "--exclude-resname",
+        action="append",
+        default=[],
+        metavar="RESNAME",
+        help="Exclude vertices with this residue_name. Can be used multiple times.",
+    )
+
+    vmd.add_argument(
+        "--max-edges",
+        type=int,
+        default=None,
+        help="Optionally draw only the strongest N edges by abs(value).",
+    )
+    vmd.add_argument(
+        "--coordinate-unit",
+        choices=("auto", "angstrom", "nm"),
+        default="auto",
+        help=(
+            "Coordinate unit returned by the structure reader. "
+            "PDB/TCL output is always written in Angstrom. "
+            "Use 'nm' if the pseudo-bead structure appears 10x too small."
+        ),
+    )
+
+    vmd.set_defaults(func=run_plot_vmd)
 
     info = subparsers.add_parser(
         "info",

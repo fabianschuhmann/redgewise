@@ -4,6 +4,7 @@ from redgewise.build_mdp import RedgewiseMdpError, read_mdp_nonbonded_informatio
 from redgewise.build_compute import compute_network, RedgewiseComputeError
 from redgewise.build_topology import get_interaction_information, RedgewiseBuildError
 import argparse
+import time
 
 @dataclass(frozen=True)
 class BuildOptions:
@@ -27,6 +28,7 @@ def build_options_from_args(args: argparse.Namespace) -> BuildOptions:
     )
 
 def run_build(args: argparse.Namespace) -> int:
+    start=time.perf_counter()
     options = build_options_from_args(args)
 
     if options.workers < 1:
@@ -48,7 +50,7 @@ def run_build(args: argparse.Namespace) -> int:
         interaction_information = get_interaction_information(topology=args.topology,tpr=args.tpr)
         mdp_information = read_mdp_nonbonded_information(args.mdp)      
 
-    except (RedgewiseComputeError, RedgewiseMdpError) as exc:
+    except (RedgewiseBuildError, RedgewiseMdpError) as exc:
         print(f"redgewise build: error: {exc}")
         return 2
 
@@ -90,8 +92,10 @@ def run_build(args: argparse.Namespace) -> int:
             output=args.output,
             options=options,
         )
-    except (RedgewiseBuildError, RedgewiseMdpError) as exc:
+    except RedgewiseBuildError as exc:
         print(f"redgewise build: error: {exc}")
         return 2
+
+    print(f"Run took {round(time.perf_counter()-start,2)} seconds.")
 
     return 0

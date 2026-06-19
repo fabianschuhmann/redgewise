@@ -7,6 +7,8 @@ from pathlib import Path
 class RedgewiseMdpError(Exception):
     """Expected MDP parsing error with user-readable message."""
 
+class RedgewiseBuildError(Exception):
+    """Expected topology/build error with a user-readable message."""
 
 @dataclass(frozen=True)
 class MdpNonbondedInformation:
