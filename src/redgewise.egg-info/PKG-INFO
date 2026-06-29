@@ -6,3 +6,6 @@ Requires-Python: >=3.10
 Requires-Dist: MDAnalysis>=2.0
 Requires-Dist: numpy>=1.26
 Requires-Dist: pyarrow>=15
+Requires-Dist: tqdm>=4.66
+Requires-Dist: matplotlib>=3.8
+Requires-Dist: rustworkx>=0.17

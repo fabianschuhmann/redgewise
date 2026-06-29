@@ -24,7 +24,7 @@ def build_options_from_args(args: argparse.Namespace) -> BuildOptions:
         high_res=tuple(args.high_res),
         low_res=tuple(args.low_res),
         bundles=tuple(tuple(bundle) for bundle in args.bundle),
-        frames_per_part=args.frames_per_part
+        frames_per_part=args.frames_per_part,
     )
 
 def run_build(args: argparse.Namespace) -> int:
@@ -38,14 +38,14 @@ def run_build(args: argparse.Namespace) -> int:
     if options.gpu:
         print("redgewise build: warning: GPU backend not implemented yet; using CPU.")
 
-    if args.workers is None or args.workers < 1:
-        print("redgewise build: error: --workers must be >= 1")
-        return 2
-
     if options.stride < 1:
         print("redgewise build: error: --stride must be >= 1")
         return 2
-        
+
+    if options.frames_per_part < 1:
+        print("redgewise build: error: --frames-per-part must be >= 1")
+        return 2
+
     try:
         interaction_information = get_interaction_information(topology=args.topology,tpr=args.tpr)
         mdp_information = read_mdp_nonbonded_information(args.mdp)      
@@ -79,9 +79,9 @@ def run_build(args: argparse.Namespace) -> int:
 
     print(f"Workers:    {args.workers}")
     print(f"GPU:        {args.gpu}")
-    print(f"High-res:   {args.high_res}")
-    print(f"Low-res:    {args.low_res}")
-    print(f"Bundles:    {args.bundle}")
+    print(f"High-res selectors: {args.high_res}")
+    print(f"Low-res selectors:  {args.low_res}")
+    print(f"Bundle selectors:   {args.bundle}")
 
     try:
         compute_summary = compute_network(
@@ -92,7 +92,7 @@ def run_build(args: argparse.Namespace) -> int:
             output=args.output,
             options=options,
         )
-    except RedgewiseBuildError as exc:
+    except (RedgewiseBuildError, RedgewiseComputeError, ValueError) as exc:
         print(f"redgewise build: error: {exc}")
         return 2
 

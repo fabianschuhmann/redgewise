@@ -1,6 +1,7 @@
 pyproject.toml
 src/redgewise/__init__.py
 src/redgewise/__main__.py
+src/redgewise/analysis_values.py
 src/redgewise/build.py
 src/redgewise/build_compute.py
 src/redgewise/build_groups.py
@@ -8,6 +9,9 @@ src/redgewise/build_information.py
 src/redgewise/build_mdp.py
 src/redgewise/build_topology.py
 src/redgewise/cli.py
+src/redgewise/info.py
+src/redgewise/plot_shortest_path.py
+src/redgewise/plot_vmd.py
 src/redgewise.egg-info/PKG-INFO
 src/redgewise.egg-info/SOURCES.txt
 src/redgewise.egg-info/dependency_links.txt

@@ -26,6 +26,9 @@ class RedgewiseComputeError(Exception):
 
 COULOMB_CONSTANT = 138.935458
 ATOM_BLOCK_SIZE = 512
+MAX_UNIT_INFERENCE_PAIRS = 20_000
+MAX_GEOMETRY_INFERENCE_ATOMS = 2_000
+UNIT_TOO_CLOSE_NM = 0.08
 
 VALUE_SCHEMA = pa.schema(
     [
@@ -54,6 +57,37 @@ class ComputeSummary:
     n_vertices: int
     n_frames: int
     n_edges: int
+
+
+@dataclass(frozen=True)
+class CoordinateScaleInference:
+    scale_to_nm: float
+    inferred_input_unit: str
+    method: str
+    n_pairs_sampled: int
+    median_distance_input: float | None
+    median_distance_nm: float | None
+    p01_distance_nm: float | None
+    p05_distance_nm: float | None
+    p50_distance_nm: float | None
+    p95_distance_nm: float | None
+    too_close_fraction_nm: float | None
+    cutoff_fraction_nm: float | None
+    note: str
+
+
+@dataclass(frozen=True)
+class DistanceScaleSummary:
+    scale_to_nm: float
+    inferred_input_unit: str
+    median_input: float
+    p01_nm: float
+    p05_nm: float
+    p50_nm: float
+    p95_nm: float
+    too_close_fraction_nm: float
+    cutoff_fraction_nm: float
+    score: float
 
 
 @dataclass
@@ -143,6 +177,346 @@ def write_vertex_members(
         compression="zstd",
     )
 
+
+
+def print_coordinate_inference(inference: CoordinateScaleInference) -> None:
+    if inference.median_distance_input is None:
+        median = "unknown"
+    else:
+        median = (
+            f"{inference.median_distance_input:.6g} input units = "
+            f"{inference.median_distance_nm:.6g} nm"
+        )
+
+    print(
+        "redgewise build: coordinate scale inferred "
+        f"from {inference.method}: "
+        f"input_unit={inference.inferred_input_unit}, "
+        f"scale_to_nm={inference.scale_to_nm:g}, "
+        f"median_local_distance={median}"
+    )
+
+    if inference.method.startswith("geometry"):
+        print(
+            "redgewise build: warning: no excluded/bonded local pairs were available "
+            "for coordinate scale inference; used nearest-neighbor geometry fallback."
+        )
+
+
+def infer_coordinate_scale_to_nm(
+    raw_positions: np.ndarray,
+    raw_box_lengths: np.ndarray | None,
+    interaction_information: Any,
+    n_atoms: int,
+    cutoff_nm: float,
+) -> CoordinateScaleInference:
+    local_pairs, local_pair_source = local_topology_pairs_for_unit_inference(
+        interaction_information=interaction_information,
+        n_atoms=n_atoms,
+    )
+
+    if len(local_pairs) > 0:
+        distances_raw = pair_distances_raw(
+            positions=raw_positions,
+            pairs=sample_pairs(local_pairs, MAX_UNIT_INFERENCE_PAIRS),
+            raw_box_lengths=raw_box_lengths,
+        )
+        distances_raw = distances_raw[np.isfinite(distances_raw) & (distances_raw > 0.0)]
+
+        if len(distances_raw) == 0:
+            raise RedgewiseComputeError(
+                "could not infer coordinate scale: local topology distances are empty"
+            )
+
+        return choose_coordinate_scale(
+            distances_raw=distances_raw,
+            cutoff_nm=cutoff_nm,
+            method=local_pair_source,
+            note=(
+                "scale inferred from topology-local excluded pairs; these should "
+                "include bonded/nrexcl-derived nonbonded exclusions"
+            ),
+        )
+
+    distances_raw = nearest_neighbor_distances_raw(
+        positions=raw_positions,
+        raw_box_lengths=raw_box_lengths,
+        max_atoms=MAX_GEOMETRY_INFERENCE_ATOMS,
+    )
+    distances_raw = distances_raw[np.isfinite(distances_raw) & (distances_raw > 0.0)]
+
+    if len(distances_raw) == 0:
+        raise RedgewiseComputeError(
+            "could not infer coordinate scale: no excluded pairs and no usable "
+            "nearest-neighbor distances"
+        )
+
+    return choose_coordinate_scale(
+        distances_raw=distances_raw,
+        cutoff_nm=cutoff_nm,
+        method="geometry_nearest_neighbors",
+        note=(
+            "scale inferred from nearest-neighbor geometry because no excluded "
+            "or bonded local pair list was available"
+        ),
+    )
+
+
+def local_topology_pairs_for_unit_inference(
+    interaction_information: Any,
+    n_atoms: int,
+) -> tuple[np.ndarray, str]:
+    # In the current build pipeline, excluded_atom_pairs is the authoritative
+    # local-topology pair set used by compute. It should include bonded,
+    # constraint, explicit exclusion, and nrexcl-derived pairs that must not be
+    # evaluated as nonbonded interactions.
+    excluded_pairs = getattr(interaction_information, "excluded_atom_pairs", set())
+    pairs = sanitize_pairs(excluded_pairs, n_atoms=n_atoms)
+
+    if len(pairs) > 0:
+        return pairs, "excluded_atom_pairs"
+
+    # Future-proofing: if build_topology later exposes direct bonds separately,
+    # those are an even cleaner coordinate-scale reference. This branch is only
+    # reached if excluded_atom_pairs is unavailable/empty.
+    bonded_pairs = getattr(interaction_information, "bonded_atom_pairs", set())
+    pairs = sanitize_pairs(bonded_pairs, n_atoms=n_atoms)
+
+    if len(pairs) > 0:
+        return pairs, "bonded_atom_pairs"
+
+    return np.empty((0, 2), dtype=np.int64), "none"
+
+
+def sanitize_pairs(
+    pairs: Iterable[tuple[int, int]],
+    n_atoms: int,
+) -> np.ndarray:
+    cleaned: set[tuple[int, int]] = set()
+
+    for atom_i, atom_j in pairs:
+        i = int(atom_i)
+        j = int(atom_j)
+
+        if i == j:
+            continue
+
+        if i < 0 or j < 0 or i >= n_atoms or j >= n_atoms:
+            continue
+
+        if i > j:
+            i, j = j, i
+
+        cleaned.add((i, j))
+
+    if not cleaned:
+        return np.empty((0, 2), dtype=np.int64)
+
+    return np.array(sorted(cleaned), dtype=np.int64)
+
+
+def sample_pairs(pairs: np.ndarray, max_pairs: int) -> np.ndarray:
+    if len(pairs) <= max_pairs:
+        return pairs
+
+    # Deterministic spread through sorted pairs. Avoid random output changes in
+    # metadata and tests.
+    indices = np.linspace(0, len(pairs) - 1, num=max_pairs, dtype=np.int64)
+    return pairs[indices]
+
+
+def pair_distances_raw(
+    positions: np.ndarray,
+    pairs: np.ndarray,
+    raw_box_lengths: np.ndarray | None,
+) -> np.ndarray:
+    delta = positions[pairs[:, 0]] - positions[pairs[:, 1]]
+
+    if raw_box_lengths is not None:
+        delta -= raw_box_lengths * np.round(delta / raw_box_lengths)
+
+    return np.linalg.norm(delta, axis=1)
+
+
+def nearest_neighbor_distances_raw(
+    positions: np.ndarray,
+    raw_box_lengths: np.ndarray | None,
+    max_atoms: int,
+) -> np.ndarray:
+    n_atoms = len(positions)
+
+    if n_atoms < 2:
+        return np.empty(0, dtype=np.float64)
+
+    if n_atoms <= max_atoms:
+        sample_indices = np.arange(n_atoms, dtype=np.int64)
+    else:
+        sample_indices = np.linspace(0, n_atoms - 1, num=max_atoms, dtype=np.int64)
+
+    sample_positions = positions[sample_indices]
+    nearest = np.full(len(sample_indices), np.inf, dtype=np.float64)
+
+    block_size = 256
+    for start in range(0, len(sample_indices), block_size):
+        stop = min(start + block_size, len(sample_indices))
+        block = sample_positions[start:stop]
+
+        delta = block[:, None, :] - sample_positions[None, :, :]
+        if raw_box_lengths is not None:
+            delta -= raw_box_lengths * np.round(delta / raw_box_lengths)
+
+        distances = np.linalg.norm(delta, axis=2)
+
+        row_indices = np.arange(start, stop) - start
+        distances[row_indices, np.arange(start, stop)] = np.inf
+        nearest[start:stop] = np.min(distances, axis=1)
+
+    return nearest[np.isfinite(nearest)]
+
+
+def choose_coordinate_scale(
+    distances_raw: np.ndarray,
+    cutoff_nm: float,
+    method: str,
+    note: str,
+) -> CoordinateScaleInference:
+    nm_summary = summarize_coordinate_scale_candidate(
+        distances_raw=distances_raw,
+        scale_to_nm=1.0,
+        inferred_input_unit="nm",
+        cutoff_nm=cutoff_nm,
+    )
+    angstrom_summary = summarize_coordinate_scale_candidate(
+        distances_raw=distances_raw,
+        scale_to_nm=0.1,
+        inferred_input_unit="angstrom",
+        cutoff_nm=cutoff_nm,
+    )
+
+    if nm_summary.score < angstrom_summary.score:
+        chosen = nm_summary
+        rejected = angstrom_summary
+    else:
+        chosen = angstrom_summary
+        rejected = nm_summary
+
+    if not np.isfinite(chosen.score):
+        raise RedgewiseComputeError("could not infer coordinate scale: invalid score")
+
+    # If both hypotheses are nearly equivalent, do not guess silently. In normal
+    # x10 unit mistakes the scores differ by orders of magnitude because one
+    # candidate creates impossible <0.08 nm local distances or >1.5 nm local bonds.
+    if abs(chosen.score - rejected.score) < 1.0:
+        raise RedgewiseComputeError(
+            "could not infer coordinate scale unambiguously: "
+            f"nm_score={nm_summary.score:.6g}, "
+            f"angstrom_score={angstrom_summary.score:.6g}, "
+            f"median_input_distance={float(np.median(distances_raw)):.6g}"
+        )
+
+    return CoordinateScaleInference(
+        scale_to_nm=chosen.scale_to_nm,
+        inferred_input_unit=chosen.inferred_input_unit,
+        method=method,
+        n_pairs_sampled=int(len(distances_raw)),
+        median_distance_input=chosen.median_input,
+        median_distance_nm=chosen.p50_nm,
+        p01_distance_nm=chosen.p01_nm,
+        p05_distance_nm=chosen.p05_nm,
+        p50_distance_nm=chosen.p50_nm,
+        p95_distance_nm=chosen.p95_nm,
+        too_close_fraction_nm=chosen.too_close_fraction_nm,
+        cutoff_fraction_nm=chosen.cutoff_fraction_nm,
+        note=(
+            f"{note}; chosen {chosen.inferred_input_unit} "
+            f"(score={chosen.score:.6g}) over {rejected.inferred_input_unit} "
+            f"(score={rejected.score:.6g})"
+        ),
+    )
+
+
+def summarize_coordinate_scale_candidate(
+    distances_raw: np.ndarray,
+    scale_to_nm: float,
+    inferred_input_unit: str,
+    cutoff_nm: float,
+) -> DistanceScaleSummary:
+    distances_nm = distances_raw * scale_to_nm
+
+    p01 = float(np.percentile(distances_nm, 1.0))
+    p05 = float(np.percentile(distances_nm, 5.0))
+    p50 = float(np.percentile(distances_nm, 50.0))
+    p95 = float(np.percentile(distances_nm, 95.0))
+    too_close_fraction = float(np.mean(distances_nm < UNIT_TOO_CLOSE_NM))
+    cutoff_fraction = float(np.mean(distances_nm <= cutoff_nm))
+
+    score = coordinate_scale_score(
+        p01_nm=p01,
+        p05_nm=p05,
+        p50_nm=p50,
+        p95_nm=p95,
+        too_close_fraction_nm=too_close_fraction,
+        cutoff_fraction_nm=cutoff_fraction,
+        cutoff_nm=cutoff_nm,
+    )
+
+    return DistanceScaleSummary(
+        scale_to_nm=scale_to_nm,
+        inferred_input_unit=inferred_input_unit,
+        median_input=float(np.median(distances_raw)),
+        p01_nm=p01,
+        p05_nm=p05,
+        p50_nm=p50,
+        p95_nm=p95,
+        too_close_fraction_nm=too_close_fraction,
+        cutoff_fraction_nm=cutoff_fraction,
+        score=score,
+    )
+
+
+def coordinate_scale_score(
+    p01_nm: float,
+    p05_nm: float,
+    p50_nm: float,
+    p95_nm: float,
+    too_close_fraction_nm: float,
+    cutoff_fraction_nm: float,
+    cutoff_nm: float,
+) -> float:
+    score = 0.0
+
+    # Hard penalty for impossible local distances. This catches the TPR-as-nm
+    # path being erroneously scaled by 0.1, where 0.4 nm contacts become 0.04 nm.
+    score += 10_000.0 * too_close_fraction_nm
+
+    if p50_nm < 0.12:
+        score += 2_000.0 * (0.12 - p50_nm) / 0.12
+
+    if p05_nm < 0.05:
+        score += 1_000.0 * (0.05 - p05_nm) / 0.05
+
+    # Local topology pairs from nrexcl can include more than direct bonds, but a
+    # median above ~1.5 nm is not plausible for excluded/bonded-local pairs in
+    # this context and indicates Angstrom-like numeric coordinates treated as nm.
+    if p50_nm > 1.5:
+        score += 2_000.0 * (p50_nm - 1.5) / 1.5
+
+    if p95_nm > max(2.5, 2.0 * cutoff_nm):
+        score += 500.0 * (p95_nm - max(2.5, 2.0 * cutoff_nm))
+
+    # Soft preference for local distances around Martini/all-atom topology scale.
+    # The score remains broad; the hard x10 penalties above drive the decision.
+    reference_nm = 0.35
+    score += abs(np.log(max(p50_nm, 1e-12) / reference_nm))
+
+    # Geometry fallback only: if almost no nearest neighbors are within cutoff,
+    # the coordinates are probably too large by x10. For excluded pairs this is
+    # normally 1.0 for both plausible and correct scales, so it is a weak term.
+    if cutoff_fraction_nm < 0.005:
+        score += 100.0
+
+    return float(score)
+
 def compute_network(
     interaction_information: Any,
     mdp_information: Any,
@@ -213,6 +587,23 @@ def compute_network(
             f"trajectory={len(universe.atoms)}, interaction_information={n_atoms}"
         )
 
+    cutoff_nm = mdp_information.max_cutoff
+
+    try:
+        first_ts = universe.trajectory[0]
+    except Exception as exc:
+        raise RedgewiseComputeError("could not read first trajectory frame") from exc
+
+    coordinate_inference = infer_coordinate_scale_to_nm(
+        raw_positions=np.asarray(universe.atoms.positions, dtype=np.float64),
+        raw_box_lengths=orthorhombic_box_lengths_raw(first_ts.dimensions),
+        interaction_information=interaction_information,
+        n_atoms=n_atoms,
+        cutoff_nm=cutoff_nm,
+    )
+
+    print_coordinate_inference(coordinate_inference)
+
     frames_per_part = getattr(options, "frames_per_part", 1)
     if frames_per_part < 1:
         raise RedgewiseComputeError("--frames-per-part must be >= 1")
@@ -223,12 +614,11 @@ def compute_network(
     total_value_rows = 0
     total_frames = 0
 
-    cutoff_nm = mdp_information.max_cutoff
-
     for processed_frame_index, ts in enumerate(universe.trajectory[:: options.stride]):
         frame_values = compute_frame_values_streaming_cells(
-            positions_a=universe.atoms.positions,
-            box_a=ts.dimensions,
+            raw_positions=universe.atoms.positions,
+            raw_box=ts.dimensions,
+            coordinate_scale_to_nm=coordinate_inference.scale_to_nm,
             frame_index=frame_index_from_ts(ts, fallback=processed_frame_index),
             cutoff_nm=cutoff_nm,
             rcoulomb_nm=mdp_information.rcoulomb,
@@ -280,6 +670,7 @@ def compute_network(
         n_edges=n_edges,
         n_value_rows=total_value_rows,
         n_excluded_atom_pairs=sum(len(neighbors) for neighbors in excluded_neighbors) // 2,
+        coordinate_inference=coordinate_inference,
     )
 
     return ComputeSummary(
@@ -291,8 +682,9 @@ def compute_network(
 
 
 def compute_frame_values_streaming_cells(
-    positions_a: np.ndarray,
-    box_a: np.ndarray,
+    raw_positions: np.ndarray,
+    raw_box: np.ndarray | None,
+    coordinate_scale_to_nm: float,
     frame_index: int,
     cutoff_nm: float,
     rcoulomb_nm: float,
@@ -306,8 +698,13 @@ def compute_frame_values_streaming_cells(
     atom_molecule_instance: np.ndarray,
     excluded_neighbors: list[set[int]],
 ) -> pa.Table:
-    positions_nm = np.asarray(positions_a, dtype=np.float64) * 0.1
-    box_lengths_nm = orthorhombic_box_lengths_nm(box_a)
+    positions_nm = np.asarray(raw_positions, dtype=np.float64) * coordinate_scale_to_nm
+    raw_box_lengths = orthorhombic_box_lengths_raw(raw_box)
+    box_lengths_nm = (
+        None
+        if raw_box_lengths is None
+        else raw_box_lengths * coordinate_scale_to_nm
+    )
 
     cell_information = build_cell_information(
         positions_nm=positions_nm,
@@ -941,11 +1338,11 @@ def write_edges_dictionary(
     return len(edge_key_array)
 
 
-def orthorhombic_box_lengths_nm(box_a: np.ndarray | None) -> np.ndarray | None:
-    if box_a is None:
+def orthorhombic_box_lengths_raw(box: np.ndarray | None) -> np.ndarray | None:
+    if box is None:
         return None
 
-    box = np.asarray(box_a, dtype=np.float64)
+    box = np.asarray(box, dtype=np.float64)
 
     if len(box) < 3:
         return None
@@ -958,7 +1355,7 @@ def orthorhombic_box_lengths_nm(box_a: np.ndarray | None) -> np.ndarray | None:
             "triclinic boxes are not supported by the streaming cell-list backend yet"
         )
 
-    return box[:3] * 0.1
+    return box[:3]
 
 
 def encode_cell_coordinates(
@@ -1041,6 +1438,7 @@ def write_metadata(
     n_edges: int,
     n_value_rows: int,
     n_excluded_atom_pairs: int,
+    coordinate_inference: CoordinateScaleInference,
 ) -> None:
     metadata = {
         "redgewise_version": __version__,
@@ -1050,9 +1448,28 @@ def write_metadata(
         "length_unit": "nm",
         "energy_unit": "kJ/mol",
         "derivative_unit": "kJ/mol/nm",
-        "coordinates_note": (
-            "MDAnalysis coordinates are Angstrom; converted to nm for energies."
+        "coordinate_unit_internal": "nm",
+        "coordinate_scale_to_nm": coordinate_inference.scale_to_nm,
+        "coordinate_input_unit_inferred": coordinate_inference.inferred_input_unit,
+        "coordinate_unit_inference_method": coordinate_inference.method,
+        "coordinate_unit_inference_n_pairs": coordinate_inference.n_pairs_sampled,
+        "coordinate_unit_inference_median_distance_input": (
+            coordinate_inference.median_distance_input
         ),
+        "coordinate_unit_inference_median_distance_nm": (
+            coordinate_inference.median_distance_nm
+        ),
+        "coordinate_unit_inference_p01_distance_nm": coordinate_inference.p01_distance_nm,
+        "coordinate_unit_inference_p05_distance_nm": coordinate_inference.p05_distance_nm,
+        "coordinate_unit_inference_p50_distance_nm": coordinate_inference.p50_distance_nm,
+        "coordinate_unit_inference_p95_distance_nm": coordinate_inference.p95_distance_nm,
+        "coordinate_unit_inference_too_close_fraction_nm": (
+            coordinate_inference.too_close_fraction_nm
+        ),
+        "coordinate_unit_inference_cutoff_fraction_nm": (
+            coordinate_inference.cutoff_fraction_nm
+        ),
+        "coordinate_unit_inference_note": coordinate_inference.note,
         "distance_backend": "streaming_orthorhombic_cell_list",
         "atom_block_size": ATOM_BLOCK_SIZE,
         "n_atoms": n_atoms,
