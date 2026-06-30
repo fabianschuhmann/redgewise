@@ -9,6 +9,7 @@ from redgewise.build import run_build
 from redgewise.info import run_info
 from redgewise.manual import ManualAction
 from redgewise.plot_neighbors import run_plot_neighbors
+from redgewise.plot_rave import run_plot_rave
 from redgewise.plot_shortest_path import run_plot_shortest_path
 from redgewise.plot_vmd import run_plot_vmd
 
@@ -170,6 +171,7 @@ def add_plot_parser(subparsers: argparse._SubParsersAction) -> None:
     add_plot_vmd_parser(plot_subparsers)
     add_plot_shortest_path_parser(plot_subparsers)
     add_plot_neighbors_parser(plot_subparsers)
+    add_plot_rave_parser(plot_subparsers)
 
 
 def add_plot_vmd_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -235,6 +237,25 @@ def add_plot_neighbors_parser(subparsers: argparse._SubParsersAction) -> None:
     add_target_argument(neighbors, "average each source only over direct neighbor endpoints matching this selector")
     add_profile_display_arguments(neighbors)
     neighbors.set_defaults(func=run_plot_neighbors)
+
+
+def add_plot_rave_parser(subparsers: argparse._SubParsersAction) -> None:
+    rave = subparsers.add_parser(
+        "rave",
+        help="plot residue-by-frame region-pair interaction heatmaps",
+        description="Plot signed direct-neighbor interactions between selected regions over frames.",
+        epilog="Use `redgewise plot rave --man` for region semantics and examples.",
+    )
+    add_manual(rave, "plot_rave")
+    rave.add_argument("-i", "--input", type=Path, required=True, help="redgewise build output directory")
+    rave.add_argument("-o", "--output", type=Path, required=True, help="output image path or directory")
+    add_value_argument(rave, "per-frame edge value plotted between regions; default: vdw+cl")
+    add_normalize_argument(rave, "normalize per-frame edge values before plotting; default: none")
+    rave.add_argument("--region", action="append", required=True, metavar="SELECTOR", help="disjoint region selector; repeat at least twice")
+    rave.add_argument("--region-label", action="append", default=[], metavar="LABEL", help="optional display label for a region; repeat exactly once per --region")
+    rave.add_argument("--alpha", type=float, default=0.95, help="overlay alpha scale for directional matrices; default: 0.7")
+    rave.add_argument("--darkmode", action="store_true", help="make only subplot interiors black; axes and figure background remain default")
+    rave.set_defaults(func=run_plot_rave)
 
 
 def add_info_parser(subparsers: argparse._SubParsersAction) -> None:
