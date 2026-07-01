@@ -557,23 +557,3 @@ table.unique("column")
 table.to_dicts(limit=10)
 table.write_tsv("out.tsv")
 ```
-
----
-
-## Development notes
-
-This project is currently in active development. The file format and CLI are intended to be stable enough for internal analysis, but some details may still evolve.
-
-Known areas for future refinement:
-
-- verify topology parsing for sigma/epsilon versus C6/C12 parameter forms;
-- improve VMD PBC minimum-image drawing for very long edges;
-- expose plot-equivalent dense missing-zero semantics through the suite API;
-- add more notebook helpers around RAVE matrices and neighbor summaries;
-- harden documentation and examples against more simulation systems.
-
----
-
-## License
-
-Add license information here.
