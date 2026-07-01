@@ -43,7 +43,7 @@ from redgewise import suite
 From a local checkout:
 
 ```bash
-git clone <repository-url>
+git clone [<repository-url>](https://github.com/fabianschuhmann/redgewise)
 cd redgewise
 python -m pip install -e .
 ```
