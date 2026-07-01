@@ -583,12 +583,12 @@ def write_residue_plot(
         set_sparse_residue_ticks(ax, x_plot, x_labels)
 
     if renumber_molecule_residues:
-        ax.set_xlabel("Residue index within molecule (compressed at gaps >2)")
+        ax.set_xlabel("Residue index within molecule")
     else:
-        ax.set_xlabel("Residue ID (compressed at gaps >2)")
-    ax.set_ylabel("Mean shortest-path interaction distance")
+        ax.set_xlabel("Residue ID")
+    ax.set_ylabel("Mean shortest-path")
     target_suffix = "" if not target_selector else f"; target={target_selector}"
-    ax.set_title(f"Shortest-path profile ({value_name}, normalization={normalization}{target_suffix})")
+    ax.set_title(f"Shortest-path profile ({value_name})")
     clean_axes(ax)
     fig.tight_layout()
     fig.savefig(path, dpi=300, bbox_inches="tight")

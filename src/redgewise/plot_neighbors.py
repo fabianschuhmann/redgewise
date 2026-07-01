@@ -650,15 +650,14 @@ def write_residue_neighbor_plot(
         ax.legend(frameon=False, fontsize=8)
 
     if renumber_molecule_residues:
-        ax.set_xlabel("Residue index within molecule (compressed at gaps >2)")
+        ax.set_xlabel("Residue index within molecule")
     else:
-        ax.set_xlabel("Residue ID (compressed at gaps >2)")
+        ax.set_xlabel("Residue ID")
     ax.set_ylabel(f"Neighbor {neighbor_summary} value")
     target_suffix = "" if not target_selector else f"; target={target_selector}"
     split_suffix = "; split excluded" if split_excluded else ""
     ax.set_title(
-        f"Direct-neighbor profile ({value_name}, normalization={normalization}, "
-        f"summary={neighbor_summary}{target_suffix}{split_suffix})"
+        f"Direct-neighbor profile ({value_name})"
     )
     clean_axes(ax)
     fig.tight_layout()

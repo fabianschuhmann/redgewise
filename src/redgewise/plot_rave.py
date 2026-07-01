@@ -625,7 +625,7 @@ def write_rave_plot(
         used_axes.append(axis)
 
     fig.suptitle(
-        f"RAVE direct-neighbor interaction heatmap ({value_name}, normalization={normalization}, |scale|={vmax:.4g})",
+        f"RAVE direct-neighbor interaction heatmap ({value_name})",
         y=0.985,
     )
     fig.tight_layout(rect=(0.0, 0.0, 0.84, 0.94))
@@ -790,7 +790,7 @@ def draw_rave_pair_panel(
     axis.set_xlim(-0.5, float(x_max) - 0.5)
     axis.set_ylim(-0.5, float(y_max) - 0.5)
     axis.set_title(title)
-    axis.set_xlabel("Residue index in source region")
+    axis.set_xlabel("Residue index in source")
     if show_ylabel:
         axis.set_ylabel("Frame")
     set_sparse_ticks(axis, x_max, forward.frames)
