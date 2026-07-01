@@ -203,20 +203,25 @@ def resolve_topology_includes(topology: Path) -> list[Path]:
         files.append(path)
 
         base_dir = path.parent
-
+        ifdef=0
         for raw_line in path.read_text().splitlines():
             line = raw_line.split(";", 1)[0].strip()
-            match = include_pattern.match(line)
+            if "#ifdef" in line:
+                ifdef+=1
+            elif "#endif" in line:
+                ifdef-=1
+            if ifdef==0:
+                match = include_pattern.match(line)
 
-            if not match:
-                continue
+                if not match:
+                    continue
 
-            include_path = Path(match.group(1)).expanduser()
+                include_path = Path(match.group(1)).expanduser()
 
-            if not include_path.is_absolute():
-                include_path = base_dir / include_path
+                if not include_path.is_absolute():
+                    include_path = base_dir / include_path
 
-            visit(include_path)
+                visit(include_path)
 
     visit(topology)
     return files
