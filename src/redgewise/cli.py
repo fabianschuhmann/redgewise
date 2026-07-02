@@ -253,7 +253,8 @@ def add_plot_rave_parser(subparsers: argparse._SubParsersAction) -> None:
     add_normalize_argument(rave, "normalize per-frame edge values before plotting; default: none")
     rave.add_argument("--region", action="append", required=True, metavar="SELECTOR", help="disjoint region selector; repeat at least twice")
     rave.add_argument("--region-label", action="append", default=[], metavar="LABEL", help="optional display label for a region; repeat exactly once per --region")
-    rave.add_argument("--alpha", type=float, default=0.95, help="overlay alpha scale for directional matrices; default: 0.7")
+    rave.add_argument("--alpha", type=float, default=0.9, help="overlay alpha scale for directional matrices; default: 0.9")
+    rave.add_argument("--pair-layout", choices=("auto", "overlay", "adjacent"), default="auto", help="directional panel layout; auto overlays compatible residue axes and puts incompatible axes adjacent; default: auto")
     rave.add_argument("--darkmode", action="store_true", help="make only subplot interiors black; axes and figure background remain default")
     rave.set_defaults(func=run_plot_rave)
 

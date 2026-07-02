@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import heapq
 import json
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -49,6 +51,16 @@ EDGE_SCHEMA = pa.schema(
         ("vertex2", pa.int32()),
     ]
 )
+
+
+EDGE_KEY_RUN_SCHEMA = pa.schema(
+    [
+        ("edge_key", pa.int64()),
+    ]
+)
+
+EDGE_KEY_MERGE_BATCH_SIZE = 1_000_000
+EDGE_KEY_MERGE_FAN_IN = 64
 
 
 @dataclass(frozen=True)
@@ -517,6 +529,66 @@ def coordinate_scale_score(
 
     return float(score)
 
+
+#DIAGNOSTIC
+import gc
+import os
+import resource
+
+
+def diagnostics_enabled() -> bool:
+    value = os.environ.get("REDGEWISE_DIAG_MEMORY", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def current_rss_mb() -> float:
+    """Current resident set size in MB on Linux.
+
+    Falls back to peak RSS if /proc is unavailable.
+    """
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    # Example: VmRSS:  123456 kB
+                    return float(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+
+    return peak_rss_mb()
+
+
+def peak_rss_mb() -> float:
+    """Peak resident set size in MB.
+
+    Linux reports ru_maxrss in KiB.
+    """
+    return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
+
+
+def arrow_table_nbytes(table) -> int:
+    """Approximate Arrow table buffer size in bytes."""
+    try:
+        return int(table.nbytes)
+    except Exception:
+        return 0
+
+
+def diagnostic_log(message: str) -> None:
+    if diagnostics_enabled():
+        print(message, flush=True)
+
+
+def diagnostic_memory_log(prefix: str) -> None:
+    if not diagnostics_enabled():
+        return
+    diagnostic_log(
+        f"[redgewise memory] {prefix} "
+        f"rss={current_rss_mb():.1f}MB "
+        f"peak={peak_rss_mb():.1f}MB"
+    )
+### END DIAGNOSTIC
+
 def compute_network(
     interaction_information: Any,
     mdp_information: Any,
@@ -632,6 +704,22 @@ def compute_network(
             atom_molecule_instance=atom_molecule_instance,
             excluded_neighbors=excluded_neighbors,
         )
+        ###DIAGNOSTIC
+        if diagnostics_enabled():
+            frame_edge_keys = frame_values.column("edge_key").to_numpy(zero_copy_only=False)
+            n_unique_edges_this_frame = int(len(np.unique(frame_edge_keys))) if len(frame_edge_keys) else 0
+
+            diagnostic_log(
+                "[redgewise memory] "
+                f"frame={frame_index_from_ts(ts, fallback=processed_frame_index)} "
+                f"processed_frame={processed_frame_index} "
+                f"rows={frame_values.num_rows} "
+                f"unique_edges_this_frame={n_unique_edges_this_frame} "
+                f"table_bytes={arrow_table_nbytes(frame_values) / (1024.0 * 1024.0):.1f}MB "
+                f"rss={current_rss_mb():.1f}MB "
+                f"peak={peak_rss_mb():.1f}MB"
+            )
+        ### END DIAGNOSTIC
 
         if frame_values.num_rows > 0:
             value_parts.append(frame_values)
@@ -641,6 +729,11 @@ def compute_network(
         total_frames += 1
 
         if frames_in_part >= frames_per_part:
+            ###DIAGNOSTIC
+            diagnostic_memory_log(
+                f"before flush part={part_index} buffered_tables={len(value_parts)}"
+            )
+            ### END DIAGONSTIC
             part_index = flush_value_parts(
                 value_parts=value_parts,
                 values_dir=values_dir,
@@ -648,6 +741,13 @@ def compute_network(
             )
             value_parts.clear()
             frames_in_part = 0
+            ###DIAGNOSTIC
+            gc.collect()
+
+            diagnostic_memory_log(
+                f"after flush part={part_index - 1}"
+            )
+            ###END DIAGNOSTIC
 
     flush_value_parts(
         value_parts=value_parts,
@@ -1309,33 +1409,351 @@ def write_edges_dictionary(
     output: Path,
     n_vertices: int,
 ) -> int:
-    edge_keys: set[int] = set()
+    """Write edges.parquet without building a global Python set of edge keys.
 
-    for path in sorted(values_dir.glob("*.parquet")):
-        table = pq.read_table(path, columns=["edge_key"])
-        edge_keys.update(int(value) for value in table.column("edge_key").to_pylist())
+    The values files already contain the edge_key column. This function builds
+    the global unique edge dictionary using an external sorted-unique merge:
 
-    edge_key_array = np.array(sorted(edge_keys), dtype=np.int64)
+    1. Each values part is reduced to a sorted unique edge-key run.
+    2. Runs are merged in bounded-fan-in rounds.
+    3. The final sorted unique edge-key run is streamed into edges.parquet.
 
-    vertex1 = (edge_key_array // n_vertices).astype(np.int32)
-    vertex2 = (edge_key_array % n_vertices).astype(np.int32)
+    This keeps memory bounded by one values part plus at most
+    EDGE_KEY_MERGE_FAN_IN run batches, instead of storing all unique edge keys
+    as Python int objects in a set.
+    """
 
-    table = pa.table(
-        {
-            "edge_key": pa.array(edge_key_array, type=pa.int64()),
-            "vertex1": pa.array(vertex1, type=pa.int32()),
-            "vertex2": pa.array(vertex2, type=pa.int32()),
-        },
-        schema=EDGE_SCHEMA,
+    temp_dir = output / "_redgewise_edge_key_runs"
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    diagnostic_memory_log("before external edge dictionary construction")
+
+    try:
+        value_parts = sorted(values_dir.glob("*.parquet"))
+        if not value_parts:
+            pq.write_table(
+                EDGE_SCHEMA.empty_table(),
+                output / "edges.parquet",
+                compression="zstd",
+            )
+            diagnostic_memory_log("no value parts; wrote empty edges.parquet")
+            return 0
+
+        runs: list[Path] = []
+
+        for part_index, values_path in enumerate(value_parts):
+            run_path = temp_dir / f"edge-keys-run-{part_index:05d}.parquet"
+
+            diagnostic_memory_log(
+                f"before unique edge-key run part={part_index} file={values_path.name}"
+            )
+
+            n_rows, n_unique = write_unique_edge_key_run_from_values_part(
+                values_path=values_path,
+                run_path=run_path,
+            )
+            runs.append(run_path)
+
+            diagnostic_log(
+                "[redgewise memory] "
+                f"edge_key_run_part={part_index} "
+                f"file={values_path.name} "
+                f"rows={n_rows} "
+                f"unique_in_part={n_unique} "
+                f"run_file={run_path.name} "
+                f"rss={current_rss_mb():.1f}MB "
+                f"peak={peak_rss_mb():.1f}MB"
+            )
+
+            gc.collect()
+
+            diagnostic_memory_log(
+                f"after unique edge-key run part={part_index} unique_in_part={n_unique}"
+            )
+
+        round_index = 0
+        while len(runs) > 1:
+            diagnostic_memory_log(
+                f"before edge-key merge round={round_index} n_runs={len(runs)}"
+            )
+
+            next_runs: list[Path] = []
+            for group_index, start_index in enumerate(range(0, len(runs), EDGE_KEY_MERGE_FAN_IN)):
+                group = runs[start_index : start_index + EDGE_KEY_MERGE_FAN_IN]
+                merged_path = temp_dir / (
+                    f"edge-keys-merge-r{round_index:03d}-g{group_index:05d}.parquet"
+                )
+
+                n_unique = merge_sorted_edge_key_runs(
+                    input_paths=group,
+                    output_path=merged_path,
+                    batch_size=EDGE_KEY_MERGE_BATCH_SIZE,
+                )
+
+                diagnostic_log(
+                    "[redgewise memory] "
+                    f"edge_key_merge_round={round_index} "
+                    f"group={group_index} "
+                    f"input_runs={len(group)} "
+                    f"unique_out={n_unique} "
+                    f"rss={current_rss_mb():.1f}MB "
+                    f"peak={peak_rss_mb():.1f}MB"
+                )
+
+                next_runs.append(merged_path)
+
+                for path in group:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+
+                gc.collect()
+
+            runs = next_runs
+            diagnostic_memory_log(
+                f"after edge-key merge round={round_index} n_runs={len(runs)}"
+            )
+            round_index += 1
+
+        final_run = runs[0]
+        diagnostic_memory_log(f"before writing edges.parquet from {final_run.name}")
+
+        n_edges = write_edges_from_unique_edge_key_run(
+            run_path=final_run,
+            output=output,
+            n_vertices=n_vertices,
+            batch_size=EDGE_KEY_MERGE_BATCH_SIZE,
+        )
+
+        diagnostic_memory_log(f"after writing edges.parquet n_edges={n_edges}")
+
+        return int(n_edges)
+
+    finally:
+        if diagnostics_enabled() and os.environ.get("REDGEWISE_KEEP_EDGE_KEY_RUNS", "").lower() in {"1", "true", "yes", "on"}:
+            diagnostic_log(f"[redgewise memory] keeping temporary edge-key runs: {temp_dir}")
+        else:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def write_unique_edge_key_run_from_values_part(
+    values_path: Path,
+    run_path: Path,
+) -> tuple[int, int]:
+    """Read one values part and write its sorted unique edge keys."""
+
+    table = pq.read_table(values_path, columns=["edge_key"])
+    keys = (
+        table.column("edge_key")
+        .to_numpy(zero_copy_only=False)
+        .astype(np.int64, copy=False)
     )
 
-    pq.write_table(
-        table,
-        output / "edges.parquet",
+    n_rows = int(len(keys))
+    unique_keys = np.unique(keys) if n_rows else np.empty(0, dtype=np.int64)
+
+    run_table = pa.table(
+        {
+            "edge_key": pa.array(unique_keys, type=pa.int64()),
+        },
+        schema=EDGE_KEY_RUN_SCHEMA,
+    )
+    pq.write_table(run_table, run_path, compression="zstd")
+
+    del keys
+    del unique_keys
+    del table
+    del run_table
+
+    return n_rows, int(pq.read_metadata(run_path).num_rows)
+
+
+class SortedEdgeKeyRunReader:
+    """Streaming reader for one sorted edge-key run."""
+
+    def __init__(self, path: Path, batch_size: int):
+        self.path = path
+        self._batches = pq.ParquetFile(path).iter_batches(
+            batch_size=batch_size,
+            columns=["edge_key"],
+        )
+        self._keys = np.empty(0, dtype=np.int64)
+        self._position = 0
+        self._exhausted = False
+
+    def next_key(self) -> int | None:
+        while self._position >= len(self._keys):
+            if self._exhausted:
+                return None
+
+            try:
+                batch = next(self._batches)
+            except StopIteration:
+                self._exhausted = True
+                self._keys = np.empty(0, dtype=np.int64)
+                self._position = 0
+                return None
+
+            self._keys = (
+                batch.column(0)
+                .to_numpy(zero_copy_only=False)
+                .astype(np.int64, copy=False)
+            )
+            self._position = 0
+
+            if len(self._keys) == 0:
+                continue
+
+        key = int(self._keys[self._position])
+        self._position += 1
+        return key
+
+
+def merge_sorted_edge_key_runs(
+    input_paths: list[Path],
+    output_path: Path,
+    batch_size: int,
+) -> int:
+    """Merge sorted unique edge-key runs into one sorted unique run."""
+
+    if not input_paths:
+        pq.write_table(
+            EDGE_KEY_RUN_SCHEMA.empty_table(),
+            output_path,
+            compression="zstd",
+        )
+        return 0
+
+    readers = [
+        SortedEdgeKeyRunReader(path=path, batch_size=batch_size)
+        for path in input_paths
+    ]
+
+    heap: list[tuple[int, int]] = []
+    for reader_index, reader in enumerate(readers):
+        key = reader.next_key()
+        if key is not None:
+            heapq.heappush(heap, (key, reader_index))
+
+    writer = pq.ParquetWriter(
+        output_path,
+        EDGE_KEY_RUN_SCHEMA,
         compression="zstd",
     )
 
-    return len(edge_key_array)
+    output_buffer: list[int] = []
+    previous_key: int | None = None
+    n_unique = 0
+    wrote_any = False
+
+    def flush_output_buffer() -> None:
+        nonlocal output_buffer, wrote_any
+        if not output_buffer:
+            return
+
+        keys = np.asarray(output_buffer, dtype=np.int64)
+        table = pa.table(
+            {
+                "edge_key": pa.array(keys, type=pa.int64()),
+            },
+            schema=EDGE_KEY_RUN_SCHEMA,
+        )
+        writer.write_table(table)
+        wrote_any = True
+        output_buffer = []
+
+    try:
+        while heap:
+            key, reader_index = heapq.heappop(heap)
+
+            next_key = readers[reader_index].next_key()
+            if next_key is not None:
+                heapq.heappush(heap, (next_key, reader_index))
+
+            if previous_key is not None and key == previous_key:
+                continue
+
+            previous_key = key
+            output_buffer.append(key)
+            n_unique += 1
+
+            if len(output_buffer) >= batch_size:
+                flush_output_buffer()
+
+        flush_output_buffer()
+
+        if not wrote_any:
+            writer.write_table(EDGE_KEY_RUN_SCHEMA.empty_table())
+
+    finally:
+        writer.close()
+
+    return int(n_unique)
+
+
+def write_edges_from_unique_edge_key_run(
+    run_path: Path,
+    output: Path,
+    n_vertices: int,
+    batch_size: int,
+) -> int:
+    """Stream one sorted unique edge-key run into edges.parquet."""
+
+    writer = pq.ParquetWriter(
+        output / "edges.parquet",
+        EDGE_SCHEMA,
+        compression="zstd",
+    )
+
+    n_edges = 0
+    wrote_any = False
+
+    try:
+        parquet_file = pq.ParquetFile(run_path)
+        for batch in parquet_file.iter_batches(
+            batch_size=batch_size,
+            columns=["edge_key"],
+        ):
+            edge_key = (
+                batch.column(0)
+                .to_numpy(zero_copy_only=False)
+                .astype(np.int64, copy=False)
+            )
+
+            if len(edge_key) == 0:
+                continue
+
+            vertex1 = (edge_key // int(n_vertices)).astype(np.int32, copy=False)
+            vertex2 = (edge_key % int(n_vertices)).astype(np.int32, copy=False)
+
+            edge_table = pa.table(
+                {
+                    "edge_key": pa.array(edge_key, type=pa.int64()),
+                    "vertex1": pa.array(vertex1, type=pa.int32()),
+                    "vertex2": pa.array(vertex2, type=pa.int32()),
+                },
+                schema=EDGE_SCHEMA,
+            )
+
+            writer.write_table(edge_table)
+            wrote_any = True
+            n_edges += int(len(edge_key))
+
+            del edge_key
+            del vertex1
+            del vertex2
+            del edge_table
+
+        if not wrote_any:
+            writer.write_table(EDGE_SCHEMA.empty_table())
+
+    finally:
+        writer.close()
+
+    return int(n_edges)
 
 
 def orthorhombic_box_lengths_raw(box: np.ndarray | None) -> np.ndarray | None:

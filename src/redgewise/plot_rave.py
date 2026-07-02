@@ -65,6 +65,8 @@ class RavePlotOutputs:
     value_name: str
     normalization: str
 
+
+
 OKABE_ITO = {
     "blue": (0.0 / 255.0, 114.0 / 255.0, 178.0 / 255.0),
     "orange": (230.0 / 255.0, 159.0 / 255.0, 0.0 / 255.0),
@@ -83,6 +85,7 @@ def run_plot_rave(args) -> None:
         region_labels=args.region_label,
         alpha=args.alpha,
         darkmode=args.darkmode,
+        pair_layout=args.pair_layout,
     )
 
     print("RAVE plot written:")
@@ -105,6 +108,7 @@ def plot_rave(
     region_labels: Iterable[str] | None = None,
     alpha: float = 0.9,
     darkmode: bool = False,
+    pair_layout: str = "auto",
 ) -> RavePlotOutputs:
     input_dir = input_dir.expanduser().resolve()
     plot_path = resolve_output_plot_path(output)
@@ -113,6 +117,7 @@ def plot_rave(
     value_name = canonical_value_name(value_name)
     normalization = canonical_normalization(normalization)
     alpha = validate_alpha(alpha)
+    pair_layout = validate_pair_layout(pair_layout)
 
     selectors = [selector for selector in region_selectors if str(selector).strip()]
     if len(selectors) < 2:
@@ -165,6 +170,7 @@ def plot_rave(
         normalization=normalization,
         alpha=alpha,
         darkmode=darkmode,
+        pair_layout=pair_layout,
     )
 
     return RavePlotOutputs(
@@ -245,6 +251,47 @@ def optional_float(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return None if math.isnan(result) else result
+
+
+
+def validate_pair_layout(pair_layout: str) -> str:
+    value = str(pair_layout).strip().lower()
+    if value not in {"auto", "overlay", "adjacent"}:
+        raise ValueError("--pair-layout must be one of: auto, overlay, adjacent")
+    return value
+
+
+
+def region_residue_name_sequence(region: RegionSpec) -> tuple[str, ...]:
+    return tuple(str(key[3]) for key in region.residue_keys)
+
+
+
+def regions_have_compatible_x_axis(region1: RegionSpec, region2: RegionSpec) -> bool:
+    """Return True when two region residue axes are safe to overlay.
+
+    Compatibility is intentionally conservative:
+    1. same number of residue bins;
+    2. same ordered residue-name sequence.
+
+    Residue IDs are deliberately ignored because numbering is often ambiguous
+    across chains, molecule copies, or prepared systems.
+    """
+
+    names1 = region_residue_name_sequence(region1)
+    names2 = region_residue_name_sequence(region2)
+    return len(names1) == len(names2) and names1 == names2
+
+
+
+def choose_pair_layout(forward: PairMatrix, reverse: PairMatrix, pair_layout: str) -> str:
+    requested = validate_pair_layout(pair_layout)
+    if requested in {"overlay", "adjacent"}:
+        return requested
+    if regions_have_compatible_x_axis(forward.source_region, reverse.source_region):
+        return "overlay"
+    return "adjacent"
+
 
 
 def resolve_regions(
@@ -584,6 +631,7 @@ def write_rave_plot(
     normalization: str,
     alpha: float,
     darkmode: bool,
+    pair_layout: str,
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -621,11 +669,12 @@ def write_rave_plot(
             darkmode=darkmode,
             title=f"{pair_index:02d}: {forward.source_region.label}↔{forward.target_region.label}",
             show_ylabel=True,
+            pair_layout=pair_layout,
         )
         used_axes.append(axis)
 
     fig.suptitle(
-        f"RAVE direct-neighbor interaction heatmap ({value_name})",
+        f"RAVE direct-neighbor interaction heatmap ({value_name}, normalization={normalization}, |scale|={vmax:.4g})",
         y=0.985,
     )
     fig.tight_layout(rect=(0.0, 0.0, 0.84, 0.94))
@@ -652,6 +701,7 @@ def write_rave_plot(
         value_name=value_name,
         normalization=normalization,
         vmax=vmax,
+        pair_layout=pair_layout,
     )
 
 
@@ -762,40 +812,166 @@ def draw_rave_pair_panel(
     darkmode: bool,
     title: str,
     show_ylabel: bool,
+    pair_layout: str,
 ) -> None:
     if darkmode:
         axis.set_facecolor("black")
 
-    draw_signed_matrix_overlay(
-        axis=axis,
-        matrix=forward.matrix,
-        frames=forward.frames,
-        cmap=forward_cmap,
-        norm=norm,
-        alpha=alpha,
-        zorder=1,
-    )
-    draw_signed_matrix_overlay(
-        axis=axis,
-        matrix=reverse.matrix,
-        frames=reverse.frames,
-        cmap=reverse_cmap,
-        norm=norm,
-        alpha=alpha,
-        zorder=2,
-    )
+    layout = choose_pair_layout(forward, reverse, pair_layout)
 
-    x_max = max(forward.matrix.shape[1], reverse.matrix.shape[1])
-    y_max = max(1, len(forward.frames))
-    axis.set_xlim(-0.5, float(x_max) - 0.5)
+    if layout == "overlay":
+        draw_signed_matrix_overlay(
+            axis=axis,
+            matrix=forward.matrix,
+            frames=forward.frames,
+            cmap=forward_cmap,
+            norm=norm,
+            alpha=alpha,
+            zorder=1,
+            x_offset=0.0,
+        )
+        draw_signed_matrix_overlay(
+            axis=axis,
+            matrix=reverse.matrix,
+            frames=reverse.frames,
+            cmap=reverse_cmap,
+            norm=norm,
+            alpha=alpha,
+            zorder=2,
+            x_offset=0.0,
+        )
+
+        x_max = max(forward.matrix.shape[1], reverse.matrix.shape[1])
+        y_max = max(1, len(forward.frames))
+        axis.set_xlim(-0.5, float(x_max) - 0.5)
+        set_sparse_ticks(axis, x_max, forward.frames)
+
+    elif layout == "adjacent":
+        n_forward = int(forward.matrix.shape[1])
+        n_reverse = int(reverse.matrix.shape[1])
+        gap = max(1, int(math.ceil(max(n_forward, n_reverse, 1) * 0.035)))
+        reverse_offset = float(n_forward + gap)
+
+        draw_signed_matrix_overlay(
+            axis=axis,
+            matrix=forward.matrix,
+            frames=forward.frames,
+            cmap=forward_cmap,
+            norm=norm,
+            alpha=alpha,
+            zorder=1,
+            x_offset=0.0,
+        )
+        draw_signed_matrix_overlay(
+            axis=axis,
+            matrix=reverse.matrix,
+            frames=reverse.frames,
+            cmap=reverse_cmap,
+            norm=norm,
+            alpha=alpha,
+            zorder=1,
+            x_offset=reverse_offset,
+        )
+
+        x_max = n_forward + gap + n_reverse
+        y_max = max(1, len(forward.frames))
+        axis.set_xlim(-0.5, float(x_max) - 0.5)
+
+        separator_x = float(n_forward) + 0.5 * float(gap) - 0.5
+        separator_color = (0.75, 0.75, 0.75) if darkmode else (0.35, 0.35, 0.35)
+        axis.axvline(separator_x, color=separator_color, linewidth=1.0, zorder=5)
+
+        draw_adjacent_block_labels(
+            axis=axis,
+            forward=forward,
+            reverse=reverse,
+            n_forward=n_forward,
+            n_reverse=n_reverse,
+            reverse_offset=reverse_offset,
+        )
+        set_adjacent_sparse_ticks(axis, n_forward, n_reverse, reverse_offset, forward.frames)
+
+    else:
+        raise ValueError(f"unsupported RAVE pair layout: {layout!r}")
+
     axis.set_ylim(-0.5, float(y_max) - 0.5)
-    axis.set_title(title)
-    axis.set_xlabel("Residue index in source")
+    axis.set_title(title, y=1.05)
+    axis.set_xlabel("Residue index in source region")
     if show_ylabel:
         axis.set_ylabel("Frame")
-    set_sparse_ticks(axis, x_max, forward.frames)
     clean_axes(axis)
 
+
+
+def draw_adjacent_block_labels(
+    axis,
+    forward: PairMatrix,
+    reverse: PairMatrix,
+    n_forward: int,
+    n_reverse: int,
+    reverse_offset: float,
+) -> None:
+    if n_forward > 0:
+        axis.text(
+            (float(n_forward) - 1.0) * 0.5,
+            1.018,
+            f"{forward.source_region.label}→{forward.target_region.label}",
+            transform=axis.get_xaxis_transform(),
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            clip_on=False,
+        )
+    if n_reverse > 0:
+        axis.text(
+            reverse_offset + (float(n_reverse) - 1.0) * 0.5,
+            1.018,
+            f"{reverse.source_region.label}→{reverse.target_region.label}",
+            transform=axis.get_xaxis_transform(),
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            clip_on=False,
+        )
+
+
+
+def set_adjacent_sparse_ticks(
+    axis,
+    n_forward: int,
+    n_reverse: int,
+    reverse_offset: float,
+    frames: np.ndarray,
+) -> None:
+    ticks: list[float] = []
+    labels: list[str] = []
+
+    if n_forward > 0:
+        forward_step = max(1, int(math.ceil(n_forward / 7)))
+        forward_ticks = list(range(0, n_forward, forward_step))
+        if n_forward - 1 not in forward_ticks:
+            forward_ticks.append(n_forward - 1)
+        ticks.extend(float(index) for index in forward_ticks)
+        labels.extend(str(index + 1) for index in forward_ticks)
+
+    if n_reverse > 0:
+        reverse_step = max(1, int(math.ceil(n_reverse / 7)))
+        reverse_ticks = list(range(0, n_reverse, reverse_step))
+        if n_reverse - 1 not in reverse_ticks:
+            reverse_ticks.append(n_reverse - 1)
+        ticks.extend(reverse_offset + float(index) for index in reverse_ticks)
+        labels.extend(str(index + 1) for index in reverse_ticks)
+
+    axis.set_xticks(ticks)
+    axis.set_xticklabels(labels, rotation=90, fontsize=7)
+
+    if len(frames) > 0:
+        y_step = max(1, int(math.ceil(len(frames) / 8)))
+        y_ticks = list(range(0, len(frames), y_step))
+        if len(frames) - 1 not in y_ticks:
+            y_ticks.append(len(frames) - 1)
+        axis.set_yticks(y_ticks)
+        axis.set_yticklabels([str(int(frames[index])) for index in y_ticks], fontsize=7)
 
 
 def draw_signed_matrix_overlay(
@@ -806,6 +982,7 @@ def draw_signed_matrix_overlay(
     norm,
     alpha: float,
     zorder: int,
+    x_offset: float = 0.0,
 ) -> None:
     if matrix.size == 0:
         return
@@ -824,7 +1001,7 @@ def draw_signed_matrix_overlay(
         origin="lower",
         aspect="auto",
         interpolation="nearest",
-        extent=(-0.5, values.shape[1] - 0.5, -0.5, len(frames) - 0.5),
+        extent=(x_offset - 0.5, x_offset + values.shape[1] - 0.5, -0.5, len(frames) - 0.5),
         cmap=cmap,
         norm=norm,
         alpha=alpha_map,
@@ -912,6 +1089,7 @@ def write_single_rave_pair_plots(
     value_name: str,
     normalization: str,
     vmax: float,
+    pair_layout: str,
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -931,10 +1109,10 @@ def write_single_rave_pair_plots(
             darkmode=darkmode,
             title=f"{forward.source_region.label}↔{forward.target_region.label}",
             show_ylabel=True,
+            pair_layout=pair_layout,
         )
         fig.suptitle(
-            f"RAVE {value_name}, normalization={normalization}, |scale|={vmax:.4g}",
-            y=0.98,
+            f"RAVE {value_name}, normalization={normalization}, |scale|={vmax:.4g}", y=.9
         )
         fig.tight_layout(rect=(0.0, 0.0, 0.80, 0.93))
         add_direction_colorbars(
